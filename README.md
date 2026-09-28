@@ -1,4 +1,4 @@
-# multithread_sims
+# HPRC Montecarlo Sims
 
 A fast C++ 6-DOF rocket Monte Carlo flight simulator for WPI HPRC. Targeting 10ms latency per flight to drogue deployment.
 
