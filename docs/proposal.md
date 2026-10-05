@@ -157,7 +157,7 @@ Template + inheritance allows abstraction of which generated model and allows al
 	- C, reusable function code interface packaging (all state in one struct)
 	- disabled memory allocation
 	- non-finite support enabled
-	- MAT-file logging
+	- MAT-file logging disabled (no file I/O inside the controller)
 	- fixed-step discrete solver
 	- data type that matches the data type of the state estimate
 	- hardware implementation matching the build target (x86-64)
@@ -179,8 +179,10 @@ void fsw_destroy(FlightSoftware* fsw);                   // flight end
 - Deterministic: the same math library in both builds (ex. the `libm` crate in Rust) and no unseeded randomness, so replays stay bit-exact.
 
 Every flight starts with a few simulated seconds on the pad, since the flight software calibrates and detects launch from sensor data. At 1 kHz, ~40 s to apogee is ~40,000 steps, so each step gets ~250 ns of the 10 ms target. Truth mode may fit; MEKF mode likely won't. To be measured early. Desktop timing is not the STM32's, so overruns need a timing model (modeled execution time added to the sim clock), which is a spike.
+
+The flight software team is still building its hardware abstraction layer, so the real flight software may not be ready when the sim is. Until then, a stub flight software sits behind the same interface: flight phases and apogee detection from rules agreed with the flight software team (or ported from the existing state machine, same thresholds and timeouts), no actuator commands, so sim-side controllers drive every actuator. Swapping in the real flight software is a link-time change. Results from the stub record it in provenance, and once the real one is linked, its nominal flight should match the stub's.
 ##### Sensor model
-Sensor models turn truth into what each sensor would read, errors included, and feed the flight software every run: its state machine detects launch and burnout from the accelerometer and barometer even in truth mode. The MEKF also reads them, but only in HITL and CI. They also produce synthetic logs for Abhay's navigator.
+Sensor models turn truth into what each sensor would read, errors included, and feed the flight software every run: its state machine detects launch and burnout from the accelerometer even in truth mode (apogee comes from the estimate). The stub reads acceleration straight from truth, so sensor models can wait until integration. The MEKF also reads them, but only in HITL and CI. They also produce synthetic logs for Abhay's navigator.
 
 We need to model:
 - individual rate of the sensor
@@ -193,13 +195,13 @@ Each added sensor is simply a new struct + config entry in the RunConfig, along 
 
 ```json
 "sensors": {
-  "imu":  { "rate_hz": 100, "latency_s": 0.0,
+  "imu":  { "rate_hz": 208, "latency_s": 0.0,
             "accel_noise_mps2": 0.05, "accel_bias_mps2": 0.1, "accel_bias_rw": 0.001,
             "gyro_noise_radps": 0.002, "gyro_bias_radps": 0.01, "gyro_bias_rw": 1e-5,
             "accel_range_g": 32, "gyro_range_dps": 2000,
             "misalign_rad": 0.002, "dropout_prob": 0.0 },
-  "baro": { "rate_hz": 25, "latency_s": 0.02, "noise_pa": 5.0, "bias_pa": 20.0 },
-  "mag":  { "rate_hz": 50, "...": "..." },
+  "baro": { "rate_hz": 75, "latency_s": 0.02, "noise_pa": 5.0, "bias_pa": 20.0 },
+  "mag":  { "rate_hz": 100, "...": "..." },
   "gps":  { "rate_hz": 1,  "latency_s": 0.1, "noise_m": 2.5 }
 }
 ```
@@ -210,7 +212,7 @@ We define a state estimate struct owned by the simulation driver, filled from tr
 ```cpp
 void estimate(const State& truth, const EstError& err, double t, StateEstimate& out);
 ```
-Error is bias, drift rate, correlation time, latency, and update rate. Each channel is held between updates at its `update_hz` (ex. altitude at the barometer's 25 Hz), which adds staleness on top of latency. Zero error is a sample rather than a separate mode, so nominal and perturbed runs go through identical code. White noise is not the interesting part: zero-mean noise on the estimate averages out in the controller, while bias and latency eat phase margin. For HITL the real filter runs onboard and we send raw measurements instead.
+Error is bias, drift rate, correlation time, latency, and update rate. Each channel is held between updates at its `update_hz` (ex. altitude at the barometer's 75 Hz), which adds staleness on top of latency. Zero error is a sample rather than a separate mode, so nominal and perturbed runs go through identical code. White noise is not the interesting part: zero-mean noise on the estimate averages out in the controller, while bias and latency eat phase margin. For HITL the real filter runs onboard and we send raw measurements instead.
 ##### Actuator model (within the plant)
 To consider both the dynamics of the actuator and its effectiveness, we model the dynamics with first order lag, rate/movement limit, and position limit. Dynamics go straight into the integrator. The effectiveness is determined by an aerodynamics and environment submodule in the plant that takes in the rocket's physical configuration. 
 ```json
@@ -233,7 +235,7 @@ To consider both the dynamics of the actuator and its effectiveness, we model th
 - Interleave coefficient table. For a given mach and $\alpha$, we get each coefficient. For locality, we fetch them all in the same lookup. We trip the mach range too, which allows use of doubles. (Tables can still stay in L1). Cache the lookup cursor since the mach changes slowly between steps. 
 - Divergent samples stop sooner than drogue deploy.
 - Per-phase (aero, EOM, state estimate, etc.) timing counters are placed behind a compile flag. Not really a profiler, just accumulated counters. Allows targeted optimization. 
-- Persistent pool of worker processes that fetch from an atomic job queue, one process per flight. The results array lives in shared memory created before fork, and each index is written by exactly one process, so no locks. At ~8 KB per record (summary + coarse trajectory + apogee window) a 20,000-sample sweep holds ~160 MB in RAM and writes it once, after every worker exits.
+- Persistent pool of worker processes (one per core, forked once) that fetch from an atomic job queue and run flights back to back. Flight software globals carry over between flights in the same process, so `fsw_create` must reset all of them, checked by a test that runs a flight alone and after others and requires bit-identical results. The results array lives in shared memory created before fork, and each index is written by exactly one process, so no locks. At ~8 KB per record (summary + coarse trajectory + apogee window) a 20,000-sample sweep holds ~160 MB in RAM and writes it once, after every worker exits.
 - Pre-touch the results array before the sweep, or first-write page faults land inside the hot loop.
 - Have each worker grab 64 indices at a time (conventional chunk size, can be adjusted) that they then work on rather than grabbing one index at a time from the job queue in the MonteCarlo Driver. 
 
@@ -242,7 +244,7 @@ To consider both the dynamics of the actuator and its effectiveness, we model th
 ##### Selection of QMC Sampling
 Plain MC has error of $\frac{\sigma}{\sqrt{N}}$. So standard error shrinks with $N^{-0.5}$. To halve the error you need 4x more samples. 
 
-Quasi-Monte Carlo replaces random points with a low discrepancy sequence (a set of deterministic numbers that fills a space more evenly and with fewer gaps than random or pseudorandom numbers). Simply put, we get a standard error that shrinks with $N^{-1}$ instead. 
+Quasi-Monte Carlo replaces random points with a low discrepancy sequence (a set of deterministic numbers that fills a space more evenly and with fewer gaps than random or pseudorandom numbers). Simply put, we get a standard error that shrinks closer to $N^{-1}$ instead. That is the best case, for smooth outputs (apogee, RMSE) where a few parameters dominate; pass/fail outputs like destroyed gain less. Plain QMC gives no error bar since the points are deterministic, so we use scrambled Sobol: a few independent randomizations of the sequence, and the spread between them is the error bar. 
 ##### Error Modeling
 We consider two types of uncertainty, Aleatory (inherent randomness modeled by a probability distribution) and Epistemic (uncertainty due to lack of knowledge, modeled with an interval). 
 - Aleatory example: wind on launch day. Epistemic example: Coeff. of Normal Force at $8° \alpha$ 
@@ -399,6 +401,7 @@ results/<timestamp>_<config_hash>/
   sigma_table.csv    the exact σ table
   summary.parquet    one row per sample, the thing you query
   traj.bin           coarse trajectories, fixed stride, memory-mappable by index
+  apogee.bin         apogee windows, fixed stride, same indexing
   report.md          the deliverable, one per sweep
   figs/*.png         referenced by report.md
 ```
